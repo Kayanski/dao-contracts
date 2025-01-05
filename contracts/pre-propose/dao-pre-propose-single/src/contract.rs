@@ -26,7 +26,6 @@ pub enum ProposeMessage {
         title: String,
         description: String,
         msgs: Vec<CosmosMsg<Empty>>,
-        vote: Option<SingleChoiceAutoVote>,
     },
 }
 
@@ -75,7 +74,6 @@ pub fn execute(
                     title,
                     description,
                     msgs,
-                    vote,
                 },
         } => ExecuteInternal::Propose {
             msg: ProposeMessageInternal::Propose(ProposeMsg {
@@ -84,7 +82,7 @@ pub fn execute(
                 title,
                 description,
                 msgs,
-                vote,
+                vote: None,
             }),
         },
         ExecuteMsg::Extension { msg } => ExecuteInternal::Extension { msg },
