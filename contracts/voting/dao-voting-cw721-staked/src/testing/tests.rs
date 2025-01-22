@@ -1,19 +1,24 @@
+use cosmwasm_std::storage_keys::to_length_prefixed_nested;
 use cosmwasm_std::testing::{mock_dependencies, mock_env};
-use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Empty, Uint128, WasmMsg};
+use cosmwasm_std::{
+    to_json_binary, to_json_vec, Addr, Coin, Decimal, Empty, Storage, Uint128, WasmMsg,
+};
 use cw721_base::msg::{ExecuteMsg as Cw721ExecuteMsg, InstantiateMsg as Cw721InstantiateMsg};
-use cw721_controllers::{NftClaim, NftClaimsResponse};
 use cw_multi_test::{next_block, App, BankSudo, Executor, SudoMsg};
+use cw_storage_plus::Map;
 use cw_utils::Duration;
 use dao_interface::voting::IsActiveResponse;
 use dao_testing::contracts::{
-    cw721_base_contract, dao_test_custom_factory, voting_cw721_staked_contract,
+    cw721_base_contract, dao_test_custom_factory_contract, dao_voting_cw721_staked_contract,
 };
 use dao_voting::threshold::{ActiveThreshold, ActiveThresholdResponse};
 
+use crate::testing::execute::{claim_legacy_nfts, claim_specific_nfts};
 use crate::{
     contract::{migrate, CONTRACT_NAME, CONTRACT_VERSION},
-    msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, NftContract, QueryMsg},
-    state::MAX_CLAIMS,
+    msg::{
+        ExecuteMsg, InstantiateMsg, MigrateMsg, NftClaim, NftClaimsResponse, NftContract, QueryMsg,
+    },
     testing::{
         execute::{
             claim_nfts, mint_and_stake_nft, mint_nft, stake_nft, unstake_nfts, update_config,
@@ -34,7 +39,7 @@ use super::{
 #[test]
 fn test_instantiate_with_new_cw721_collection() -> anyhow::Result<()> {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
 
     let module_addr = app
@@ -192,7 +197,8 @@ fn test_update_config() -> anyhow::Result<()> {
         NftClaimsResponse {
             nft_claims: vec![NftClaim {
                 token_id: "1".to_string(),
-                release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 3)
+                release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 3),
+                legacy: false,
             }]
         }
     );
@@ -214,7 +220,8 @@ fn test_update_config() -> anyhow::Result<()> {
         NftClaimsResponse {
             nft_claims: vec![NftClaim {
                 token_id: "1".to_string(),
-                release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 3)
+                release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 3),
+                legacy: false,
             }]
         }
     );
@@ -229,11 +236,13 @@ fn test_update_config() -> anyhow::Result<()> {
             nft_claims: vec![
                 NftClaim {
                     token_id: "1".to_string(),
-                    release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 3)
+                    release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 3),
+                    legacy: false,
                 },
                 NftClaim {
                     token_id: "2".to_string(),
-                    release_at: Duration::Time(1).after(&app.block_info())
+                    release_at: Duration::Time(1).after(&app.block_info()),
+                    legacy: false,
                 }
             ]
         }
@@ -284,7 +293,8 @@ fn test_claims() -> anyhow::Result<()> {
         claims.nft_claims,
         vec![NftClaim {
             token_id: "2".to_string(),
-            release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 1)
+            release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 1),
+            legacy: false,
         }]
     );
 
@@ -301,24 +311,169 @@ fn test_claims() -> anyhow::Result<()> {
     Ok(())
 }
 
-// I can not have more than MAX_CLAIMS claims pending.
+// I can query and claim my pending legacy claims and non-legacy claims.
 #[test]
-fn test_max_claims() -> anyhow::Result<()> {
+pub fn test_legacy_claims_work() -> anyhow::Result<()> {
     let CommonTest {
         mut app,
         module,
         nft,
     } = setup_test(Some(Duration::Height(1)));
 
-    for i in 0..MAX_CLAIMS {
-        let i_str = &i.to_string();
-        mint_and_stake_nft(&mut app, &nft, &module, CREATOR_ADDR, i_str)?;
-        unstake_nfts(&mut app, &module, CREATOR_ADDR, &[i_str])?;
-    }
+    mint_and_stake_nft(&mut app, &nft, &module, CREATOR_ADDR, "1")?;
+    mint_and_stake_nft(&mut app, &nft, &module, CREATOR_ADDR, "2")?;
+    mint_and_stake_nft(&mut app, &nft, &module, CREATOR_ADDR, "3")?;
+    mint_and_stake_nft(&mut app, &nft, &module, CREATOR_ADDR, "4")?;
+    mint_and_stake_nft(&mut app, &nft, &module, CREATOR_ADDR, "5")?;
 
-    mint_and_stake_nft(&mut app, &nft, &module, CREATOR_ADDR, "a")?;
-    let res = unstake_nfts(&mut app, &module, CREATOR_ADDR, &["a"]);
-    is_error!(res => "Too many outstanding claims. Claim some tokens before unstaking more.");
+    let claims = query_claims(&app, &module, CREATOR_ADDR)?;
+    assert_eq!(claims.nft_claims, vec![]);
+
+    let res = claim_legacy_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+    let res = claim_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+
+    // insert legacy claims manually
+
+    // taken from cw-multi-test's WasmKeeper::contract_storage in wasm.rs
+    let mut module_namespace = b"contract_data/".to_vec();
+    module_namespace.extend_from_slice(module.as_bytes());
+    let prefix = to_length_prefixed_nested(&[b"wasm", &module_namespace]);
+    let key = Map::<&Addr, Vec<NftClaim>>::new("nft_claims").key(&Addr::unchecked(CREATOR_ADDR));
+    let mut legacy_nft_claims_key = prefix;
+    legacy_nft_claims_key.extend_from_slice(&key);
+
+    let block = app.block_info();
+    app.storage_mut().set(
+        &legacy_nft_claims_key,
+        &to_json_vec(&vec![cw721_controllers_v250::NftClaim {
+            token_id: "4".to_string(),
+            release_at: Duration::Height(1).after(&block),
+        }])
+        .unwrap(),
+    );
+
+    let claims = query_claims(&app, &module, CREATOR_ADDR)?;
+    assert_eq!(
+        claims.nft_claims,
+        vec![NftClaim {
+            token_id: "4".to_string(),
+            release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 1),
+            legacy: true,
+        }]
+    );
+
+    // claim now exists, but is not yet expired. Nothing to claim.
+    let res = claim_legacy_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+    let res = claim_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+
+    app.update_block(next_block);
+
+    // no non-legacy claims
+    let res = claim_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+
+    // legacy claim works
+    claim_legacy_nfts(&mut app, &module, CREATOR_ADDR).unwrap();
+    let owner = query_nft_owner(&app, &nft, "4")?;
+    assert_eq!(owner.owner, CREATOR_ADDR.to_string());
+
+    // unstake non-legacy
+    unstake_nfts(&mut app, &module, CREATOR_ADDR, &["2"])?;
+
+    let claims = query_claims(&app, &module, CREATOR_ADDR)?;
+    assert_eq!(
+        claims.nft_claims,
+        vec![NftClaim {
+            token_id: "2".to_string(),
+            release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 1),
+            legacy: false,
+        }]
+    );
+
+    // Claim now exists, but is not yet expired. Nothing to claim.
+    let res = claim_legacy_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+    let res = claim_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+
+    app.update_block(next_block);
+
+    // no legacy claims
+    let res = claim_legacy_nfts(&mut app, &module, CREATOR_ADDR);
+    is_error!(res => "Nothing to claim");
+
+    claim_nfts(&mut app, &module, CREATOR_ADDR)?;
+
+    let owner = query_nft_owner(&app, &nft, "2")?;
+    assert_eq!(owner.owner, CREATOR_ADDR.to_string());
+
+    // unstake another non-legacy
+    unstake_nfts(&mut app, &module, CREATOR_ADDR, &["3"])?;
+
+    let claims = query_claims(&app, &module, CREATOR_ADDR)?;
+    assert_eq!(
+        claims.nft_claims,
+        vec![NftClaim {
+            token_id: "3".to_string(),
+            release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 1),
+            legacy: false,
+        }]
+    );
+
+    app.update_block(next_block);
+
+    claim_specific_nfts(&mut app, &module, CREATOR_ADDR, &["3".to_string()])?;
+    let owner = query_nft_owner(&app, &nft, "3")?;
+    assert_eq!(owner.owner, CREATOR_ADDR.to_string());
+
+    // unstake legacy
+    let block = app.block_info();
+    app.storage_mut().set(
+        &legacy_nft_claims_key,
+        &to_json_vec(&vec![cw721_controllers_v250::NftClaim {
+            token_id: "5".to_string(),
+            release_at: Duration::Height(1).after(&block),
+        }])
+        .unwrap(),
+    );
+    // unstake non-legacy
+    unstake_nfts(&mut app, &module, CREATOR_ADDR, &["1"])?;
+
+    let claims = query_claims(&app, &module, CREATOR_ADDR)?;
+    assert_eq!(
+        claims.nft_claims,
+        vec![
+            NftClaim {
+                token_id: "5".to_string(),
+                release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 1),
+                legacy: true,
+            },
+            NftClaim {
+                token_id: "1".to_string(),
+                release_at: cw_utils::Expiration::AtHeight(app.block_info().height + 1),
+                legacy: false,
+            }
+        ]
+    );
+
+    app.update_block(next_block);
+
+    // both claims should be ready to claim
+    claim_legacy_nfts(&mut app, &module, CREATOR_ADDR)?;
+    claim_nfts(&mut app, &module, CREATOR_ADDR)?;
+
+    let owner = query_nft_owner(&app, &nft, "1")?;
+    assert_eq!(owner.owner, CREATOR_ADDR.to_string());
+    let owner = query_nft_owner(&app, &nft, "5")?;
+    assert_eq!(owner.owner, CREATOR_ADDR.to_string());
+
+    // no claims left
+    let claims = query_claims(&app, &module, CREATOR_ADDR)?;
+    assert_eq!(claims.nft_claims, vec![]);
 
     Ok(())
 }
@@ -421,7 +576,7 @@ fn test_add_remove_hooks() -> anyhow::Result<()> {
 #[test]
 fn test_instantiate_with_invalid_duration_fails() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
 
     let err = app
@@ -462,7 +617,7 @@ fn test_instantiate_with_invalid_duration_fails() {
 fn test_instantiate_zero_active_threshold_count() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     app.instantiate_contract(
         module_id,
@@ -502,7 +657,7 @@ fn test_instantiate_zero_active_threshold_count() {
 fn test_instantiate_invalid_active_threshold_count_new_nft() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     app.instantiate_contract(
         module_id,
@@ -541,7 +696,7 @@ fn test_instantiate_invalid_active_threshold_count_new_nft() {
 #[should_panic(expected = "Absolute count threshold cannot be greater than the total token supply")]
 fn test_instantiate_invalid_active_threshold_count_existing_nft() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_addr = instantiate_cw721_base(&mut app, CREATOR_ADDR, CREATOR_ADDR);
 
     app.instantiate_contract(
@@ -567,7 +722,7 @@ fn test_instantiate_invalid_active_threshold_count_existing_nft() {
 fn test_active_threshold_absolute_count() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     let voting_addr = app
         .instantiate_contract(
@@ -647,7 +802,7 @@ fn test_active_threshold_absolute_count() {
 fn test_active_threshold_percent() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     let voting_addr = app
         .instantiate_contract(
@@ -708,7 +863,7 @@ fn test_active_threshold_percent() {
 fn test_active_threshold_percent_rounds_up() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     let voting_addr = app
         .instantiate_contract(
@@ -810,7 +965,7 @@ fn test_active_threshold_percent_rounds_up() {
 fn test_update_active_threshold() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     let voting_addr = app
         .instantiate_contract(
@@ -887,7 +1042,7 @@ fn test_update_active_threshold() {
 fn test_active_threshold_percentage_gt_100() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     app.instantiate_contract(
         module_id,
@@ -929,7 +1084,7 @@ fn test_active_threshold_percentage_gt_100() {
 fn test_active_threshold_percentage_lte_0() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     app.instantiate_contract(
         module_id,
@@ -967,7 +1122,7 @@ fn test_active_threshold_percentage_lte_0() {
 #[test]
 fn test_invalid_instantiate_msg() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
 
     let err = app
@@ -1006,7 +1161,7 @@ fn test_invalid_instantiate_msg() {
 #[test]
 fn test_invalid_initial_nft_msg() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
 
     let err = app
@@ -1045,7 +1200,7 @@ fn test_invalid_initial_nft_msg() {
 #[test]
 fn test_invalid_initial_nft_msg_wrong_absolute_count() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
 
     let err = app
@@ -1096,7 +1251,7 @@ fn test_invalid_initial_nft_msg_wrong_absolute_count() {
 fn test_no_initial_nfts_fails() {
     let mut app = App::default();
     let cw721_id = app.store_code(cw721_base_contract());
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
 
     let err = app
         .instantiate_contract(
@@ -1133,9 +1288,9 @@ fn test_no_initial_nfts_fails() {
 #[test]
 fn test_factory() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
-    let factory_id = app.store_code(dao_test_custom_factory());
+    let factory_id = app.store_code(dao_test_custom_factory_contract());
 
     // Instantiate factory
     let factory_addr = app
@@ -1186,9 +1341,9 @@ fn test_factory() {
 #[test]
 fn test_factory_with_funds_pass_through() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
-    let factory_id = app.store_code(dao_test_custom_factory());
+    let factory_id = app.store_code(dao_test_custom_factory_contract());
 
     // Mint some tokens to creator
     app.sudo(SudoMsg::Bank(BankSudo::Mint {
@@ -1307,7 +1462,7 @@ fn test_factory_with_funds_pass_through() {
 #[should_panic(expected = "Factory message must serialize to WasmMsg::Execute")]
 fn test_unsupported_factory_msg() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let cw721_id = app.store_code(cw721_base_contract());
 
     // Instantiate using factory succeeds
@@ -1352,9 +1507,9 @@ fn test_unsupported_factory_msg() {
 )]
 fn test_factory_wrong_callback() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let _cw721_id = app.store_code(cw721_base_contract());
-    let factory_id = app.store_code(dao_test_custom_factory());
+    let factory_id = app.store_code(dao_test_custom_factory_contract());
 
     // Instantiate factory
     let factory_addr = app
@@ -1400,9 +1555,9 @@ fn test_factory_wrong_callback() {
 #[should_panic(expected = "Invalid reply from sub-message: Missing reply data")]
 fn test_factory_no_callback() {
     let mut app = App::default();
-    let module_id = app.store_code(voting_cw721_staked_contract());
+    let module_id = app.store_code(dao_voting_cw721_staked_contract());
     let _cw721_id = app.store_code(cw721_base_contract());
-    let factory_id = app.store_code(dao_test_custom_factory());
+    let factory_id = app.store_code(dao_test_custom_factory_contract());
 
     // Instantiate factory
     let factory_addr = app

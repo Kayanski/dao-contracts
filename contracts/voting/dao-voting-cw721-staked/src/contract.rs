@@ -17,10 +17,14 @@ use dao_voting::threshold::{
     ActiveThresholdResponse,
 };
 
-use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, NftContract, QueryMsg};
+use crate::msg::{
+    ClaimType, ExecuteMsg, InstantiateMsg, MigrateMsg, NftClaim, NftClaimsResponse, NftContract,
+    QueryMsg,
+};
 use crate::state::{
     register_staked_nft, register_unstaked_nfts, Config, ACTIVE_THRESHOLD, CONFIG, DAO, HOOKS,
-    INITIAL_NFTS, MAX_CLAIMS, NFT_BALANCES, NFT_CLAIMS, STAKED_NFTS_PER_OWNER, TOTAL_STAKED_NFTS,
+    INITIAL_NFTS, LEGACY_NFT_CLAIMS, NFT_BALANCES, NFT_CLAIMS, STAKED_NFTS_PER_OWNER,
+    TOTAL_STAKED_NFTS,
 };
 use crate::ContractError;
 
@@ -204,7 +208,7 @@ pub fn execute(
     match msg {
         ExecuteMsg::ReceiveNft(msg) => execute_stake(deps, env, info, msg),
         ExecuteMsg::Unstake { token_ids } => execute_unstake(deps, env, info, token_ids),
-        ExecuteMsg::ClaimNfts {} => execute_claim_nfts(deps, env, info),
+        ExecuteMsg::ClaimNfts { r#type } => execute_claim_nfts(deps, env, info, r#type),
         ExecuteMsg::UpdateConfig { duration } => execute_update_config(info, deps, duration),
         ExecuteMsg::AddHook { addr } => execute_add_hook(deps, info, addr),
         ExecuteMsg::RemoveHook { addr } => execute_remove_hook(deps, info, addr),
@@ -314,13 +318,6 @@ pub fn execute_unstake(
         }
 
         Some(duration) => {
-            let outstanding_claims = NFT_CLAIMS
-                .query_claims(deps.as_ref(), &info.sender)?
-                .nft_claims;
-            if outstanding_claims.len() + token_ids.len() > MAX_CLAIMS as usize {
-                return Err(ContractError::TooManyClaims {});
-            }
-
             // Out of gas here is fine - just try again with fewer
             // tokens.
             NFT_CLAIMS.create_nft_claims(
@@ -343,22 +340,52 @@ pub fn execute_claim_nfts(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
+    claim_type: ClaimType,
 ) -> Result<Response, ContractError> {
-    let nfts = NFT_CLAIMS.claim_nfts(deps.storage, &info.sender, &env.block)?;
-    if nfts.is_empty() {
+    let token_ids = match claim_type {
+        // attempt to claim all legacy NFTs
+        ClaimType::Legacy => {
+            LEGACY_NFT_CLAIMS.claim_nfts(deps.storage, &info.sender, &env.block)?
+        }
+        // attempt to claim all non-legacy NFTs
+        ClaimType::All => {
+            let token_ids = NFT_CLAIMS
+                .query_claims(deps.as_ref(), &info.sender, None, None)?
+                .into_iter()
+                .filter(|nft| nft.release_at.is_expired(&env.block))
+                .map(|nft| nft.token_id)
+                .collect::<Vec<_>>();
+
+            if !token_ids.is_empty() {
+                NFT_CLAIMS.claim_nfts(deps.storage, &info.sender, &token_ids, &env.block)?;
+            }
+
+            token_ids
+        }
+        // attempt to claim specific non-legacy NFTs
+        ClaimType::Specific(token_ids) => {
+            if !token_ids.is_empty() {
+                NFT_CLAIMS.claim_nfts(deps.storage, &info.sender, &token_ids, &env.block)?;
+            }
+
+            token_ids
+        }
+    };
+
+    if token_ids.is_empty() {
         return Err(ContractError::NothingToClaim {});
     }
 
     let config = CONFIG.load(deps.storage)?;
 
-    let msgs = nfts
+    let msgs = token_ids
         .into_iter()
-        .map(|nft| -> StdResult<CosmosMsg> {
+        .map(|token_id| -> StdResult<CosmosMsg> {
             Ok(WasmMsg::Execute {
                 contract_addr: config.nft_address.to_string(),
                 msg: to_json_binary(&cw721::Cw721ExecuteMsg::TransferNft {
                     recipient: info.sender.to_string(),
-                    token_id: nft,
+                    token_id,
                 })?,
                 funds: vec![],
             }
@@ -485,7 +512,11 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::Dao {} => query_dao(deps),
         QueryMsg::Info {} => query_info(deps),
         QueryMsg::IsActive {} => query_is_active(deps, env),
-        QueryMsg::NftClaims { address } => query_nft_claims(deps, address),
+        QueryMsg::NftClaims {
+            address,
+            start_after,
+            limit,
+        } => query_nft_claims(deps, address, start_after, limit),
         QueryMsg::Hooks {} => query_hooks(deps),
         QueryMsg::StakedNfts {
             address,
@@ -606,8 +637,41 @@ pub fn query_dao(deps: Deps) -> StdResult<Binary> {
     to_json_binary(&dao)
 }
 
-pub fn query_nft_claims(deps: Deps, address: String) -> StdResult<Binary> {
-    to_json_binary(&NFT_CLAIMS.query_claims(deps, &deps.api.addr_validate(&address)?)?)
+pub fn query_nft_claims(
+    deps: Deps,
+    address: String,
+    start_after: Option<String>,
+    limit: Option<u32>,
+) -> StdResult<Binary> {
+    let addr = deps.api.addr_validate(&address)?;
+
+    // load all legacy claims since it does not support pagination
+    let legacy_claims = LEGACY_NFT_CLAIMS
+        .query_claims(deps, &addr)?
+        .nft_claims
+        .into_iter()
+        .map(|c| NftClaim {
+            token_id: c.token_id,
+            release_at: c.release_at,
+            legacy: true,
+        })
+        .collect::<Vec<_>>();
+
+    // paginate all new claims
+    let claims = NFT_CLAIMS
+        .query_claims(deps, &addr, start_after.as_ref(), limit)?
+        .into_iter()
+        .map(|c| NftClaim {
+            token_id: c.token_id,
+            release_at: c.release_at,
+            legacy: false,
+        })
+        .collect::<Vec<_>>();
+
+    // combine legacy and new claims
+    let nft_claims = legacy_claims.into_iter().chain(claims).collect();
+
+    to_json_binary(&NftClaimsResponse { nft_claims })
 }
 
 pub fn query_hooks(deps: Deps) -> StdResult<Binary> {

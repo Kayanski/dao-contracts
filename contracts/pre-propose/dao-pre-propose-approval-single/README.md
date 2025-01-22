@@ -3,11 +3,13 @@
 [![dao-pre-propose-approval-single on crates.io](https://img.shields.io/crates/v/dao-pre-propose-approval-single.svg?logo=rust)](https://crates.io/crates/dao-pre-propose-approval-single)
 [![docs.rs](https://img.shields.io/docsrs/dao-pre-propose-approval-single?logo=docsdotrs)](https://docs.rs/dao-pre-propose-approval-single/latest/dao_pre_propose_approval_single/)
 
-This contract implements an approval flow for proposals, it also handles deposit logic. It works with the `cwd-proposal-single` proposal module.
+This contract implements an approval flow for proposals, it also handles deposit logic. It works with the `dao-proposal-single` proposal module.
 
 ## Approval Logic
 
-This contract is instantatied with an `approver` address. This address is allowed to approve or reject the proposal.
+This contract is instantatied with an `approver` address. This address is
+allowed to approve or reject the proposal. An approved proposal opens for voting
+immediately, whereas a rejected proposal is simply discarded.
 
 ```text
       ┌──────────┐
@@ -43,7 +45,7 @@ This contract is instantatied with an `approver` address. This address is allowe
 └────────────────────────┘
 ```
 
-The `approver` may also register a `ProposalSubmitHook`, which fires every time a proposal is submitted to the `cwd-pre-propose-approval-single` contract.
+The `approver` may also register a `ProposalSubmitHook`, which fires every time a proposal is submitted to the `dao-pre-propose-approval-single` contract.
 
 ## Deposit Logic
 

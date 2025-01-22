@@ -1,10 +1,10 @@
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Binary, Empty, StdError, StdResult, Storage, Uint128};
-use cw721_controllers::NftClaims;
 use cw_hooks::Hooks;
 use cw_storage_plus::{Item, Map, SnapshotItem, SnapshotMap, Strategy};
 use cw_utils::Duration;
 use dao_voting::threshold::ActiveThreshold;
+use nft_controllers::NftClaims;
 
 use crate::ContractError;
 
@@ -42,9 +42,14 @@ pub const TOTAL_STAKED_NFTS: SnapshotItem<Uint128> = SnapshotItem::new(
     Strategy::EveryBlock,
 );
 
-/// The maximum number of claims that may be outstanding.
-pub const MAX_CLAIMS: u64 = 70;
-pub const NFT_CLAIMS: NftClaims = NftClaims::new("nft_claims");
+/// The legacy NFT claims storage uses a non-paginatable vector, which limits
+/// the number of claims that may be outstanding. This is horrible UX,
+/// especially for large NFT collections. To allow DAOs to upgrade, we must keep
+/// the legacy NFT claims storage, but we can paginate the new storage.
+pub const LEGACY_NFT_CLAIMS: cw721_controllers_v250::NftClaims =
+    cw721_controllers_v250::NftClaims::new("nft_claims");
+
+pub const NFT_CLAIMS: NftClaims = NftClaims::new("nc");
 
 // Hooks to contracts that will receive staking and unstaking
 // messages.

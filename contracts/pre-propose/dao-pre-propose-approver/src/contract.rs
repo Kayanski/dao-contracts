@@ -7,15 +7,16 @@ use cosmwasm_std::{
 use cw2::set_contract_version;
 
 use dao_interface::state::ModuleInstantiateCallback;
-use dao_pre_propose_approval_single::msg::{
-    ApproverProposeMessage, ExecuteExt as ApprovalExt, ExecuteMsg as PreProposeApprovalExecuteMsg,
+use dao_pre_propose_base::{
+    error::PreProposeError, msg::ExecuteMsg as PreProposeExecuteBase, state::PreProposeContract,
 };
-use dao_pre_propose_base::{error::PreProposeError, state::PreProposeContract};
+use dao_voting::approval::{ApprovalExecuteExt, ApproverProposeMessage};
+use dao_voting::pre_propose::PreProposeSubmissionPolicy;
 use dao_voting::status::Status;
 
 use crate::msg::{
-    BaseInstantiateMsg, ExecuteExt, ExecuteMsg, InstantiateMsg, ProposeMessageInternal, QueryExt,
-    QueryMsg,
+    BaseInstantiateMsg, ExecuteExt, ExecuteMsg, InstantiateMsg, MigrateMsg, ProposeMessageInternal,
+    QueryExt, QueryMsg,
 };
 use crate::state::{
     PRE_PROPOSE_APPROVAL_CONTRACT, PRE_PROPOSE_ID_TO_PROPOSAL_ID, PROPOSAL_ID_TO_PRE_PROPOSE_ID,
@@ -24,7 +25,9 @@ use crate::state::{
 pub(crate) const CONTRACT_NAME: &str = "crates.io:dao-pre-propose-approver";
 pub(crate) const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-type PrePropose = PreProposeContract<Empty, ExecuteExt, QueryExt, ApproverProposeMessage>;
+type PrePropose = PreProposeContract<Empty, ExecuteExt, QueryExt, Empty, ApproverProposeMessage>;
+type PreProposeApprovalExecuteMsg =
+    PreProposeExecuteBase<ApproverProposeMessage, ApprovalExecuteExt>;
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
@@ -33,11 +36,16 @@ pub fn instantiate(
     info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, PreProposeError> {
-    // This contract does not handle deposits or have open submissions
-    // Here we hardcode the pre-propose-base instantiate message
+    // This contract does not handle deposits or allow submission permissions
+    // since only the approval-* contract can create proposals. Just hardcode
+    // the pre-propose-base instantiate message.
     let base_instantiate_msg = BaseInstantiateMsg {
         deposit_info: None,
-        open_proposal_submission: false,
+        submission_policy: PreProposeSubmissionPolicy::Specific {
+            dao_members: true,
+            allowlist: vec![],
+            denylist: vec![],
+        },
         extension: Empty {},
     };
     // Default pre-propose-base instantiation
@@ -49,7 +57,7 @@ pub fn instantiate(
     )?;
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
-    // Validate and save the address of the pre-propose-approval-single contract
+    // Validate and save the address of the pre-propose-approval-* contract
     let addr = deps.api.addr_validate(&msg.pre_propose_approval_contract)?;
     PRE_PROPOSE_APPROVAL_CONTRACT.save(deps.storage, &addr)?;
 
@@ -65,7 +73,7 @@ pub fn instantiate(
             CosmosMsg::Wasm(WasmMsg::Execute {
                 contract_addr: addr.to_string(),
                 msg: to_json_binary(&PreProposeApprovalExecuteMsg::Extension {
-                    msg: ApprovalExt::UpdateApprover {
+                    msg: ApprovalExecuteExt::UpdateApprover {
                         address: env.contract.address.to_string(),
                     },
                 })?,
@@ -92,6 +100,9 @@ pub fn execute(
         ExecuteMsg::Extension { msg } => match msg {
             ExecuteExt::ResetApprover {} => execute_reset_approver(deps, env, info),
         },
+        // Override config updates since they don't apply.
+        ExecuteMsg::UpdateConfig { .. } => Err(PreProposeError::Unsupported {}),
+        ExecuteMsg::UpdateSubmissionPolicy { .. } => Err(PreProposeError::Unsupported {}),
         _ => PrePropose::default().execute(deps, env, info, msg),
     }
 }
@@ -107,7 +118,7 @@ pub fn execute_propose(
         return Err(PreProposeError::Unauthorized {});
     }
 
-    // Get pre_prospose_id, transform proposal for the approver
+    // Get pre_propose_id, transform proposal for the approver
     // Here we make sure that there are no messages that can be executed
     let (pre_propose_id, sanitized_msg) = match msg {
         ApproverProposeMessage::Propose {
@@ -164,14 +175,14 @@ pub fn execute_proposal_completed(
         Status::Closed => Some(WasmMsg::Execute {
             contract_addr: approval_contract.into_string(),
             msg: to_json_binary(&PreProposeApprovalExecuteMsg::Extension {
-                msg: ApprovalExt::Reject { id: pre_propose_id },
+                msg: ApprovalExecuteExt::Reject { id: pre_propose_id },
             })?,
             funds: vec![],
         }),
         Status::Executed => Some(WasmMsg::Execute {
             contract_addr: approval_contract.into_string(),
             msg: to_json_binary(&PreProposeApprovalExecuteMsg::Extension {
-                msg: ApprovalExt::Approve { id: pre_propose_id },
+                msg: ApprovalExecuteExt::Approve { id: pre_propose_id },
             })?,
             funds: vec![],
         }),
@@ -214,7 +225,7 @@ pub fn execute_reset_approver(
         CosmosMsg::Wasm(WasmMsg::Execute {
             contract_addr: pre_propose_approval_contract.to_string(),
             msg: to_json_binary(&PreProposeApprovalExecuteMsg::Extension {
-                msg: ApprovalExt::UpdateApprover {
+                msg: ApprovalExecuteExt::UpdateApprover {
                     address: dao.to_string(),
                 },
             })?,
@@ -228,6 +239,11 @@ pub fn execute_reset_approver(
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
+        QueryMsg::CanPropose { address } => {
+            let approval_contract = PRE_PROPOSE_APPROVAL_CONTRACT.load(deps.storage)?;
+            let can_propose = address == approval_contract;
+            to_json_binary(&can_propose)
+        }
         QueryMsg::QueryExtension { msg } => match msg {
             QueryExt::PreProposeApprovalContract {} => {
                 to_json_binary(&PRE_PROPOSE_APPROVAL_CONTRACT.load(deps.storage)?)
@@ -241,4 +257,11 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         },
         _ => PrePropose::default().query(deps, env, msg),
     }
+}
+
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn migrate(mut deps: DepsMut, _env: Env, msg: MigrateMsg) -> Result<Response, PreProposeError> {
+    let res = PrePropose::default().migrate(deps.branch(), msg);
+    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+    res
 }

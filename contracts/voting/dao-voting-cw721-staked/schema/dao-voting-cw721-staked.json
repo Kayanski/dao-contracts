@@ -1,6 +1,6 @@
 {
   "contract_name": "dao-voting-cw721-staked",
-  "contract_version": "2.4.2",
+  "contract_version": "2.6.0",
   "idl_version": "1.0.0",
   "instantiate": {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -273,6 +273,14 @@
         "properties": {
           "claim_nfts": {
             "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "$ref": "#/definitions/ClaimType"
+              }
+            },
             "additionalProperties": false
           }
         },
@@ -429,6 +437,40 @@
         "description": "Binary is a wrapper around Vec<u8> to add base64 de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is only needed as serde-json-{core,wasm} has a horrible encoding for Vec<u8>. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
         "type": "string"
       },
+      "ClaimType": {
+        "oneOf": [
+          {
+            "description": "Claims all legacy claims.",
+            "type": "string",
+            "enum": [
+              "legacy"
+            ]
+          },
+          {
+            "description": "Claims all non-legacy claims.",
+            "type": "string",
+            "enum": [
+              "all"
+            ]
+          },
+          {
+            "description": "Claims specific non-legacy NFTs.",
+            "type": "object",
+            "required": [
+              "specific"
+            ],
+            "properties": {
+              "specific": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
       "Cw721ReceiveMsg": {
         "description": "Cw721ReceiveMsg should be de/serialized under `Receive()` variant in a ExecuteMsg",
         "type": "object",
@@ -525,6 +567,20 @@
             "properties": {
               "address": {
                 "type": "string"
+              },
+              "limit": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint32",
+                "minimum": 0.0
+              },
+              "start_after": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "additionalProperties": false
@@ -963,14 +1019,25 @@
         "NftClaim": {
           "type": "object",
           "required": [
+            "legacy",
             "release_at",
             "token_id"
           ],
           "properties": {
+            "legacy": {
+              "description": "Whether the claim is a legacy claim.",
+              "type": "boolean"
+            },
             "release_at": {
-              "$ref": "#/definitions/Expiration"
+              "description": "The expiration time of the claim.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Expiration"
+                }
+              ]
             },
             "token_id": {
+              "description": "The token ID of the NFT being claimed.",
               "type": "string"
             }
           },

@@ -34,10 +34,13 @@ cw-core-v1 = { workspace = true, features = ["library"] }
 abstract-cw-plus-interface = "3.0.0"
 abstract-cw20 = "3.0.0"
 abstract-cw20-base = "3.0.0"
-cw-multi-test = { workspace = true, features = ["stargate"] }
+cw-multi-test = { workspace = true }
 cw-orch = { workspace = true }
+
+dao-dao-core = { workspace = true }
 cw20-base = { workspace = true }
 cw721-base = { workspace = true }
 dao-cw-orch = { path = "../../packages/cw-orch" }
 dao-proposal-sudo = { workspace = true }
+dao-testing = { workspace = true }
 dao-voting-cw20-balance = { workspace = true }

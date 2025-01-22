@@ -1,6 +1,6 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::Binary;
-use cw721::Cw721ReceiveMsg;
+use cw721::{Cw721ReceiveMsg, Expiration};
 use cw_utils::Duration;
 use dao_dao_macros::{active_query, voting_module_query};
 use dao_voting::threshold::{ActiveThreshold, ActiveThresholdResponse};
@@ -56,7 +56,7 @@ pub enum ExecuteMsg {
     /// length.
     Unstake { token_ids: Vec<String> },
     /// Claim NFTs that have been unstaked for the specified duration.
-    ClaimNfts {},
+    ClaimNfts { r#type: ClaimType },
     /// Updates the contract configuration, namely unstaking duration.
     /// Only callable by the DAO that initialized this voting contract.
     UpdateConfig { duration: Option<Duration> },
@@ -73,6 +73,16 @@ pub enum ExecuteMsg {
     },
 }
 
+#[cw_serde]
+pub enum ClaimType {
+    /// Claims all legacy claims.
+    Legacy,
+    /// Claims all non-legacy claims.
+    All,
+    /// Claims specific non-legacy NFTs.
+    Specific(Vec<String>),
+}
+
 #[active_query]
 #[voting_module_query]
 #[cw_serde]
@@ -80,8 +90,12 @@ pub enum ExecuteMsg {
 pub enum QueryMsg {
     #[returns(crate::state::Config)]
     Config {},
-    #[returns(::cw721_controllers::NftClaimsResponse)]
-    NftClaims { address: String },
+    #[returns(NftClaimsResponse)]
+    NftClaims {
+        address: String,
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
     #[returns(::cw_controllers::HooksResponse)]
     Hooks {},
     // List the staked NFTs for a given address.
@@ -93,6 +107,21 @@ pub enum QueryMsg {
     },
     #[returns(ActiveThresholdResponse)]
     ActiveThreshold {},
+}
+
+#[cw_serde]
+pub struct NftClaimsResponse {
+    pub nft_claims: Vec<NftClaim>,
+}
+
+#[cw_serde]
+pub struct NftClaim {
+    /// The token ID of the NFT being claimed.
+    pub token_id: String,
+    /// The expiration time of the claim.
+    pub release_at: Expiration,
+    /// Whether the claim is a legacy claim.
+    pub legacy: bool,
 }
 
 #[cw_serde]

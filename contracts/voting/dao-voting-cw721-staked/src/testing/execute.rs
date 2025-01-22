@@ -5,7 +5,7 @@ use cw_multi_test::{App, AppResponse, Executor};
 use anyhow::Result as AnyResult;
 use cw_utils::Duration;
 
-use crate::msg::ExecuteMsg;
+use crate::msg::{ClaimType, ExecuteMsg};
 
 // Shorthand for an unchecked address.
 macro_rules! addr {
@@ -110,7 +110,36 @@ pub fn claim_nfts(app: &mut App, module: &Addr, sender: &str) -> AnyResult<AppRe
     app.execute_contract(
         addr!(sender),
         module.clone(),
-        &ExecuteMsg::ClaimNfts {},
+        &ExecuteMsg::ClaimNfts {
+            r#type: ClaimType::All,
+        },
+        &[],
+    )
+}
+
+pub fn claim_specific_nfts(
+    app: &mut App,
+    module: &Addr,
+    sender: &str,
+    token_ids: &[String],
+) -> AnyResult<AppResponse> {
+    app.execute_contract(
+        addr!(sender),
+        module.clone(),
+        &ExecuteMsg::ClaimNfts {
+            r#type: ClaimType::Specific(token_ids.to_vec()),
+        },
+        &[],
+    )
+}
+
+pub fn claim_legacy_nfts(app: &mut App, module: &Addr, sender: &str) -> AnyResult<AppResponse> {
+    app.execute_contract(
+        addr!(sender),
+        module.clone(),
+        &ExecuteMsg::ClaimNfts {
+            r#type: ClaimType::Legacy,
+        },
         &[],
     )
 }
